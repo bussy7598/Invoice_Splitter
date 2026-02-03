@@ -7,6 +7,7 @@ import streamlit as st
 import easyocr
 from pdf2image import convert_from_bytes
 from PIL import Image
+import numpy as np
 
 
 # -------------------------
@@ -54,8 +55,8 @@ def ocr_page_image(image: Image.Image, reader: easyocr.Reader) -> str:
     """
     OCR the whole page. Returns a single combined text string.
     """
-    # easyocr returns [(bbox, text, conf), ...]
-    results = reader.readtext(image)
+    img_np = np.array(image.convert("RGB"))  # PIL -> numpy array (supported by easyocr)
+    results = reader.readtext(img_np)
     return " ".join([r[1] for r in results if r and len(r) > 1])
 
 
