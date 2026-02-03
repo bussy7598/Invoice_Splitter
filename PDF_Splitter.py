@@ -2,11 +2,14 @@ import re
 import io
 import zipfile
 from datetime import datetime
+from typing import Optional, List
 
 import streamlit as st
+
+import pdfplumber
 from pypdf import PdfReader, PdfWriter
 
-# OCR deps are optional – only used if we must
+# OCR / image deps (used only if needed)
 from pdf2image import convert_from_bytes
 from PIL import Image
 import numpy as np
@@ -24,30 +27,63 @@ def safe_filename(s: str, max_len: int = 120) -> str:
     return s[:max_len] if len(s) > max_len else s
 
 
-def extract_tax_invoice_no_from_text(text: str) -> str | None:
+def extract_tax_invoice_no(text: str) -> Optional[str]:
+    """
+    Extract invoice number from text like:
+      'Tax Invoice No: 1007585'
+
+    More tolerant:
+      - handles weird spacing/newlines
+      - handles digits that may be spaced: "1 0 0 7 5 8 5"
+    """
     text = (text or "").replace("\xa0", " ")
     text = re.sub(r"[ \t]+", " ", text)
 
+    # Capture digits that might contain internal spaces
     m = re.search(
-        r"\bTax\s+Invoice\s+No\.?\s*:?\s*([0-9]{4,})\b",
+        r"\bTax\s+Invoice\s+No\.?\s*:?\s*([0-9][0-9\s]{3,})\b",
         text,
         flags=re.IGNORECASE,
     )
-    return m.group(1) if m else None
+    if not m:
+        return None
+
+    digits = re.sub(r"\s+", "", m.group(1))
+    return digits if digits.isdigit() else None
+
+
+def get_invoice_numbers_by_page_pdfplumber(pdf_bytes: bytes) -> List[Optional[str]]:
+    """
+    Best-effort per-page invoice number extraction using pdfplumber.
+    """
+    invs: List[Optional[str]] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            invs.append(extract_tax_invoice_no(page_text))
+    return invs
 
 
 @st.cache_resource
 def get_ocr_reader():
+    # Cached so it doesn't reload models every run
     return easyocr.Reader(["en"], gpu=False)
 
 
 def ocr_page_image(image: Image.Image, reader: easyocr.Reader) -> str:
+    """
+    OCR a PIL image via EasyOCR (requires numpy array input).
+    """
     img_np = np.array(image.convert("RGB"))
     results = reader.readtext(img_np)
     return " ".join([r[1] for r in results if r and len(r) > 1])
 
 
 def page_image_to_single_page_pdf_bytes(image: Image.Image) -> bytes:
+    """
+    Save a PIL image as a 1-page PDF (bytes).
+    Note: OCR fallback outputs "image PDFs" (not vector).
+    """
     buf = io.BytesIO()
     if image.mode != "RGB":
         image = image.convert("RGB")
@@ -56,70 +92,76 @@ def page_image_to_single_page_pdf_bytes(image: Image.Image) -> bytes:
     return buf.read()
 
 
+def build_unique_filename(base: str, used_names: set, page_num: int) -> str:
+    """
+    base: invoice number or unmatched label
+    returns a unique filename with .pdf extension
+    """
+    base = safe_filename(base)
+    filename = f"{base}.pdf"
+    key = filename.lower()
+
+    if key in used_names:
+        filename = f"{base}__p{page_num:02d}.pdf"
+        key = filename.lower()
+
+    used_names.add(key)
+    return filename
+
+
 def split_pdf_to_zip(pdf_bytes: bytes, skip_unmatched: bool, force_ocr: bool) -> bytes:
     """
     Strategy:
-      1) Try PDF text extraction per page (fast)
-      2) If nothing found anywhere (or force_ocr=True), OCR pages (slow)
+      1) Use pdfplumber per-page text extraction (best for invoices)
+      2) If still no hits anywhere OR force_ocr=True, fall back to OCR
     """
-    used_names = set()
     zip_buffer = io.BytesIO()
+    used_names = set()
 
-    # ---------
-    # Pass 1: Text extraction
-    # ---------
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    text_hits = []
+    # Text-first using pdfplumber
+    invs = []
     if not force_ocr:
-        for page in reader.pages:
-            inv = extract_tax_invoice_no_from_text(page.extract_text() or "")
-            text_hits.append(inv)
+        invs = get_invoice_numbers_by_page_pdfplumber(pdf_bytes)
 
-    any_text_found = any(text_hits)
+    any_found = any(invs) if invs else False
 
     with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        if any_text_found and not force_ocr:
-            # Write original page PDFs (keeps vector quality)
+        if any_found and not force_ocr:
+            # Split using pypdf (keeps original PDF quality)
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+
             for i, page in enumerate(reader.pages, start=1):
-                inv_no = text_hits[i - 1]
+                inv_no = invs[i - 1] if (i - 1) < len(invs) else None
 
                 if not inv_no and skip_unmatched:
                     continue
 
                 base = inv_no if inv_no else f"unmatched_page_{i:02d}"
-                filename = safe_filename(base) + ".pdf"
+                filename = build_unique_filename(base, used_names, i)
 
-                if filename.lower() in used_names:
-                    filename = safe_filename(base) + f"__p{i:02d}.pdf"
-                used_names.add(filename.lower())
+                writer = PdfWriter()
+                writer.add_page(page)
 
-                w = PdfWriter()
-                w.add_page(page)
                 out_pdf = io.BytesIO()
-                w.write(out_pdf)
+                writer.write(out_pdf)
                 out_pdf.seek(0)
+
                 zf.writestr(filename, out_pdf.read())
 
         else:
-            # ---------
-            # Pass 2: OCR fallback
-            # ---------
+            # OCR fallback (slow, but works for scanned PDFs)
             ocr_reader = get_ocr_reader()
             images = convert_from_bytes(pdf_bytes, dpi=200)
 
             for i, image in enumerate(images, start=1):
                 ocr_text = ocr_page_image(image, ocr_reader)
-                inv_no = extract_tax_invoice_no_from_text(ocr_text)
+                inv_no = extract_tax_invoice_no(ocr_text)
 
                 if not inv_no and skip_unmatched:
                     continue
 
                 base = inv_no if inv_no else f"unmatched_page_{i:02d}"
-                filename = safe_filename(base) + ".pdf"
-
-                if filename.lower() in used_names:
-                    filename = safe_filename(base) + f"__p{i:02d}.pdf"
-                used_names.add(filename.lower())
+                filename = build_unique_filename(base, used_names, i)
 
                 zf.writestr(filename, page_image_to_single_page_pdf_bytes(image))
 
@@ -135,7 +177,7 @@ st.title("PDF Splitter — filename = Tax Invoice No (e.g. 1007585.pdf)")
 
 uploaded = st.file_uploader("Upload PDF", type=["pdf"])
 skip_unmatched = st.checkbox("Skip pages without a Tax Invoice No", value=False)
-force_ocr = st.checkbox("Force OCR (slower, use only for scanned PDFs)", value=False)
+force_ocr = st.checkbox("Force OCR (slower — only for scanned PDFs)", value=False)
 
 if uploaded:
     pdf_bytes = uploaded.getvalue()
@@ -143,19 +185,15 @@ if uploaded:
     st.subheader("Preview (first 8 pages)")
     preview = []
 
-    # Preview: text-first
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    for i in range(1, min(8, len(reader.pages)) + 1):
-        inv_no = None
+    # Preview uses pdfplumber (more reliable than pypdf for invoice text)
+    invs = get_invoice_numbers_by_page_pdfplumber(pdf_bytes)
 
-        if not force_ocr:
-            inv_no = extract_tax_invoice_no_from_text(reader.pages[i - 1].extract_text() or "")
-
-        # If not found and forcing OCR, show placeholder – OCR happens on split
+    for i in range(1, min(8, len(invs)) + 1):
+        inv_no = invs[i - 1]
         preview.append(
             {
                 "Page": i,
-                "Detected Tax Invoice No": inv_no or ("(OCR on split)" if force_ocr else "(none)"),
+                "Detected Tax Invoice No": inv_no or ("(will OCR on split)" if force_ocr else "(none)"),
                 "Output filename": f"{inv_no}.pdf" if inv_no else f"unmatched_page_{i:02d}.pdf",
             }
         )
@@ -165,7 +203,11 @@ if uploaded:
     st.divider()
     if st.button("Split and create ZIP", type="primary"):
         try:
-            zip_bytes = split_pdf_to_zip(pdf_bytes, skip_unmatched=skip_unmatched, force_ocr=force_ocr)
+            zip_bytes = split_pdf_to_zip(
+                pdf_bytes,
+                skip_unmatched=skip_unmatched,
+                force_ocr=force_ocr,
+            )
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             st.download_button(
                 "Download ZIP",
